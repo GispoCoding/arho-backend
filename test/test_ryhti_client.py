@@ -403,7 +403,7 @@ def client_with_plan_data(
     return client
 
 
-def test_related_land_use_area(
+def test_related_land_use_area_for_other_areas(
     complete_test_plan: models.Plan,
     land_use_area_instance: models.LandUseArea,
     other_area_instance: models.OtherArea,
@@ -427,6 +427,31 @@ def test_related_land_use_area(
     assert other_area_in_dict
 
     assert other_area_in_dict["relatedPlanObjectKeys"] == [land_use_area_instance.id]
+
+
+def test_related_land_use_area_for_points(
+    complete_test_plan: models.Plan,
+    land_use_area_instance: models.LandUseArea,
+    construction_point_instance: models.Point,
+    client_with_plan_data: RyhtiClient,
+) -> None:
+    """Test that the land use area that contains the other area of type 'rakennusala'
+    is added to the related plan objects list.
+    """
+    plan_dict = client_with_plan_data.database_client.plan_dictionaries[
+        complete_test_plan.id
+    ]
+    point_in_dict = next(
+        (
+            plan_object
+            for plan_object in plan_dict["planObjects"]
+            if plan_object["planObjectKey"] == construction_point_instance.id
+        ),
+        None,
+    )
+
+    assert point_in_dict
+    assert point_in_dict["relatedPlanObjectKeys"] == [land_use_area_instance.id]
 
 
 @pytest.fixture

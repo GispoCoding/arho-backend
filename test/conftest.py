@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Generator, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -990,6 +990,28 @@ def other_area_instance(
 
 
 @pytest.fixture
+def construction_point_instance(
+    temp_session_feature: ReturnSame[models.Point],
+    preparation_status_instance: codes.LifeCycleStatus,
+    type_of_underground_instance: codes.TypeOfUnderground,
+    plan_instance: codes.Plan,
+    construction_area_plan_regulation_group_instance: codes.PlanRegulationGroup,
+) -> models.Point:
+    instance = models.Point(
+        geom=from_shape(
+            shape({"type": "MultiPoint", "coordinates": [[382953, 6678582]]}),
+            srid=PROJECT_SRID,
+            extended=True,
+        ),
+        lifecycle_status=preparation_status_instance,
+        type_of_underground=type_of_underground_instance,
+        plan=plan_instance,
+        plan_regulation_groups=[construction_area_plan_regulation_group_instance],
+    )
+    return temp_session_feature(instance)
+
+
+@pytest.fixture
 def line_instance(
     temp_session_feature: ReturnSame[models.Line],
     preparation_status_instance: codes.LifeCycleStatus,
@@ -1546,6 +1568,7 @@ def complete_test_plan(
     pedestrian_street_instance: models.LandUseArea,
     other_area_instance: models.OtherArea,
     point_instance: models.Point,
+    construction_point_instance: models.Point,
     plan_regulation_group_instance: models.PlanRegulationGroup,
     pedestrian_plan_regulation_group_instance: models.PlanRegulationGroup,
     construction_area_plan_regulation_group_instance: models.PlanRegulationGroup,
@@ -1821,6 +1844,7 @@ def desired_plan_dict(
     pedestrian_street_instance: models.LandUseArea,
     other_area_instance: models.OtherArea,
     point_instance: models.Point,
+    construction_point_instance: models.Point,
     plan_regulation_group_instance: models.PlanRegulationGroup,
     numeric_plan_regulation_group_instance: models.PlanRegulationGroup,
     decimal_plan_regulation_group_instance: models.PlanRegulationGroup,
@@ -1839,7 +1863,7 @@ def desired_plan_dict(
     verbal_plan_regulation_instance: models.PlanRegulation,
     general_plan_regulation_instance: models.PlanRegulation,
     plan_proposition_instance: models.PlanProposition,
-) -> dict:
+) -> dict[str, Any]:
     """Plan dict based on https://github.com/sykefi/Ryhti-rajapintakuvaukset/blob/main/OpenApi/Kaavoitus/Avoin/ryhti-plan-public-validate-api.json
 
     Let's 1) write explicitly the complex fields, and 2) just check that the simple fields have
@@ -1999,6 +2023,19 @@ def desired_plan_dict(
                 "name": point_instance.name,
                 "description": point_instance.description,
                 "objectNumber": point_instance.ordering,
+            },
+            {
+                "planObjectKey": construction_point_instance.id,
+                "lifeCycleStatus": "http://uri.suomi.fi/codelist/rytj/kaavaelinkaari/code/03",
+                "undergroundStatus": "http://uri.suomi.fi/codelist/rytj/RY_MaanalaisuudenLaji/code/01",
+                "geometry": {
+                    "srid": str(PROJECT_SRID),
+                    "geometry": {"type": "Point", "coordinates": [382953.0, 6678582.0]},
+                },
+                "name": construction_point_instance.name,
+                "description": construction_point_instance.description,
+                "objectNumber": construction_point_instance.ordering,
+                "relatedPlanObjectKeys": [land_use_area_instance.id],
             },
         ],
         # groups will not be in order by object, because we join all the group ids together to find
@@ -2318,6 +2355,10 @@ def desired_plan_dict(
             },
             {
                 "planObjectKey": other_area_instance.id,
+                "planRegulationGroupKey": construction_area_plan_regulation_group_instance.id,
+            },
+            {
+                "planObjectKey": construction_point_instance.id,
                 "planRegulationGroupKey": construction_area_plan_regulation_group_instance.id,
             },
             {
