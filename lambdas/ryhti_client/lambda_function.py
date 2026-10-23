@@ -9,8 +9,9 @@ import time
 import uuid
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 import boto3
 import requests
@@ -25,6 +26,7 @@ from database.db_helper import (
     get_connection_string,
     get_user_credentials,
 )
+from database.enums import JobStatus
 from ryhti_client.database_client import (
     ApprovalDateRequiredError,
     DatabaseClient,
@@ -36,6 +38,13 @@ from ryhti_client.database_client import (
     PlanNotValidError,
     StartDateRequiredError,
     is_valid_plan,
+)
+from ryhti_client.jobs import (
+    JobNotStartedError,
+    JobStore,
+    is_uuid,
+    is_worker_event,
+    lambda_job_starter,
 )
 from ryhti_client.plan_copier import CopyPlanData
 from ryhti_client.profiling import log_duration, profile_python
@@ -50,6 +59,7 @@ from ryhti_client.wfs_importer import (
 
 if TYPE_CHECKING:
     from database import models
+    from ryhti_client.jobs import JobStarter
     from ryhti_client.ryhti_client import RyhtiResponse
 
 # All non-request specific initialization should be done *before* the handler
@@ -103,6 +113,27 @@ if not ryhti_files_bucket:
     )
 presigned_url_expiry_seconds = int(os.environ.get("PRESIGNED_URL_EXPIRY_SECONDS", 3600))
 
+# A job still queued or running this long after it was created or started has
+# crashed, see JobStore.get. Terraform sets it to the lambda timeout.
+job_time_limit_seconds = os.environ.get("JOB_TIME_LIMIT_SECONDS", "")
+if not job_time_limit_seconds:
+    raise ValueError(
+        "Please set JOB_TIME_LIMIT_SECONDS environment variable to run Ryhti client."
+    )
+job_time_limit = timedelta(seconds=int(job_time_limit_seconds))
+
+# How a submitted job starts, see choose_job_starter.
+job_runner = os.environ.get("JOB_RUNNER", "")
+if job_runner not in {"inline", "lambda"}:
+    raise ValueError(
+        "Please set JOB_RUNNER environment variable to 'inline' or 'lambda' to run "
+        f"Ryhti client. It is {job_runner!r}."
+    )
+# With JOB_RUNNER=lambda, a job runs in a new invocation of this function.
+lambda_client = boto3.client(
+    "lambda", region_name=os.environ.get("AWS_REGION_NAME", "") or None
+)
+
 # WFS service that publishes valid plans as open data, for import_wfs_plans.
 ryhti_wfs_url = os.environ.get(
     "RYHTI_WFS_URL", "https://paikkatiedot.ymparisto.fi/geoserver/ryhti_plan/wfs"
@@ -122,6 +153,13 @@ s3_client = boto3.client(
     endpoint_url=s3_endpoint_url,
     config=Config(signature_version="s3v4"),
 )
+
+
+class LambdaContext(Protocol):
+    """The part of the AWS Lambda context object that the handler reads."""
+
+    # The ARN this invocation was called with, with the alias or version.
+    invoked_function_arn: str
 
 
 class ResponseBody(TypedDict):
@@ -178,6 +216,14 @@ class ArhoPayload(TypedDict):
     # True if we want to force the action, if needed
     force: NotRequired[bool | None]
 
+    # True to run the action as a background job. The response is then 202 with
+    # the job_id, and get_job returns the response of the action as the result
+    # of the job when it is done.
+    run_as_job: NotRequired[bool | None]
+
+    # The job to read, for get_job.
+    job_id: NotRequired[str | None]
+
     # HTTP headers, if lambda function called directly
     headers: NotRequired[dict[str, str]]
 
@@ -211,7 +257,7 @@ class AWSAPIGatewayResponse(TypedDict):
     isBase64Encoded: NotRequired[bool]
 
 
-class Action(enum.Enum):
+class Action(enum.StrEnum):
     GET_PLAN = "get_plan"
     VALIDATE_PLAN = "validate_plan"
     GET_PERMANENT_IDENTIFIER = "get_permanent_plan_identifier"
@@ -225,6 +271,7 @@ class Action(enum.Enum):
     COPY_PLAN = "copy_plan"
     FINALIZE_PLAN = "finalize_plan"
     GET_UPLOAD_URL = "get_upload_url"
+    GET_JOB = "get_job"
 
 
 # Actions that operate on a single plan and require a plan_uuid in the event.
@@ -354,6 +401,57 @@ def check_action_preconditions(
     return None
 
 
+def check_request(event: ArhoPayload) -> Response | None:
+    """Check that the request names an action that can be run with the event.
+
+    The checks need no database, so they can run before any work starts.
+    Returns an error response if the request cannot be run, otherwise None.
+    """
+    action_name = event.get("action")
+    if action_name is None:
+        return simple_response(400, "Missing action.", {"error": "action is required."})
+    try:
+        event_type = Action(action_name)
+    except ValueError:
+        return simple_response(
+            400, "Unknown action.", {"error": f"Unknown action: {action_name}"}
+        )
+    if event_type is Action.GET_JOB:
+        return check_job_id(event.get("job_id"))
+    return check_action_preconditions(event_type, action_name, event.get("plan_uuid"))
+
+
+def check_job_id(job_id: str | None) -> Response | None:
+    """Check that get_job names a job by a valid UUID.
+
+    Returns an error response if it does not, otherwise None.
+    """
+    if not job_id:
+        return simple_response(
+            400, "Missing job_id.", {"error": "job_id is required for action get_job."}
+        )
+    if not is_uuid(job_id):
+        return simple_response(
+            400, "Invalid job_id.", {"error": "job_id must be a valid UUID."}
+        )
+    return None
+
+
+def create_upload_url() -> Response:
+    """Return a presigned URL that the client can PUT the plan file to before
+    calling import_plan. No database access is needed.
+    """
+    key = f"import/{uuid.uuid4()}.json"
+    upload_url = s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": ryhti_files_bucket, "Key": key},
+        ExpiresIn=presigned_url_expiry_seconds,
+    )
+    return simple_response(
+        200, "Upload URL created.", {"upload_url": upload_url, "key": key}
+    )
+
+
 def finalize_plan_action(
     plan: models.Plan, database_client: DatabaseClient, client: RyhtiClient
 ) -> Response:
@@ -408,7 +506,7 @@ def finalize_plan_action(
 
 
 type HandlerType = Callable[
-    [ArhoPayload | AWSAPIGatewayPayload, dict[str, Any]],
+    [ArhoPayload | AWSAPIGatewayPayload, LambdaContext],
     Response | CompressedResponse | AWSAPIGatewayResponse,
 ]
 
@@ -418,7 +516,7 @@ def return_500_on_unhandled_exceptions[**P, R](func: HandlerType) -> HandlerType
 
     @wraps(func)
     def wrapper(
-        payload: ArhoPayload | AWSAPIGatewayPayload, context: dict[str, Any]
+        payload: ArhoPayload | AWSAPIGatewayPayload, context: LambdaContext
     ) -> Response | CompressedResponse | AWSAPIGatewayResponse:
         try:
             return func(payload, context)
@@ -444,14 +542,48 @@ def return_500_on_unhandled_exceptions[**P, R](func: HandlerType) -> HandlerType
     return wrapper
 
 
-def log_action_duration(func: HandlerType) -> HandlerType:
-    """Decorator to log a parseable line with the action name and handler
-    wall time, for CloudWatch Logs Insights duration queries per action.
+def log_invocation_duration(action: str, start: float) -> None:
+    """Log a parseable line with the action name and the handler wall time
+    since start, for CloudWatch Logs Insights duration queries per action.
     """
+    LOGGER.info(
+        "arho_timing action=%s duration_ms=%d",
+        action,
+        round((time.perf_counter() - start) * 1000),
+    )
+
+
+def is_job_submit(event: ArhoPayload) -> bool:
+    """Return True if the request asks to run its action as a job.
+
+    Only the JSON value true turns job mode on. get_upload_url and get_job
+    ignore the flag, so that a client may send it on every request.
+    """
+    return event.get("run_as_job") is True and event.get("action") not in {
+        Action.GET_UPLOAD_URL,
+        Action.GET_JOB,
+    }
+
+
+def timing_action(event: ArhoPayload) -> str:
+    """Return the action name for the duration line of a request.
+
+    A job submit is named submit:<action>, so that submits, job runs
+    (job:<action>, see run_job_event) and calls without the job flag are
+    separate rows in the per-action duration query.
+    """
+    action = str(event.get("action"))
+    if is_job_submit(event):
+        return f"submit:{action}"
+    return action
+
+
+def log_action_duration(func: HandlerType) -> HandlerType:
+    """Decorator to log the duration line of a request, see log_invocation_duration."""
 
     @wraps(func)
     def wrapper(
-        payload: ArhoPayload | AWSAPIGatewayPayload, context: dict[str, Any]
+        payload: ArhoPayload | AWSAPIGatewayPayload, context: LambdaContext
     ) -> Response | CompressedResponse | AWSAPIGatewayResponse:
         start = time.perf_counter()
         try:
@@ -459,15 +591,11 @@ def log_action_duration(func: HandlerType) -> HandlerType:
         finally:
             action = "unknown"
             try:
-                action = str(normalize_payload(payload)["body"].get("action"))
+                action = timing_action(normalize_payload(payload)["body"])
             except Exception:  # noqa: BLE001
                 # Timing is best effort; never mask the response.
                 LOGGER.warning("Could not resolve action name for timing log.")
-            LOGGER.info(
-                "arho_timing action=%s duration_ms=%d",
-                action,
-                round((time.perf_counter() - start) * 1000),
-            )
+            log_invocation_duration(action, start)
 
     return wrapper
 
@@ -502,70 +630,16 @@ def normalize_payload(event: ArhoPayload | AWSAPIGatewayPayload) -> NormalizedEv
     return {"raw_event": raw_event, "headers": headers, "body": body}
 
 
-@return_500_on_unhandled_exceptions
-@log_action_duration
-def handler(
-    payload: ArhoPayload | AWSAPIGatewayPayload, context: dict[str, Any]
-) -> Response | CompressedResponse | AWSAPIGatewayResponse:
-    """Handler which is called when accessing the endpoint. We must handle both API
-    gateway HTTP requests and regular lambda requests. API gateway requires
-    the response body to be stringified.
+def run_action(event: ArhoPayload) -> Response:
+    """Run the action of a request that has passed check_request.
 
-    If lambda runs successfully, we always return 200 OK. In case a python
-    exception occurs, AWS lambda will return the exception.
-
-    We want to return general result message of the lambda run, as well as the
-    Ryhti API response for actions that call the Ryhti API.
+    Every action except get_upload_url runs here, so every caller gets the same
+    response to the same request. The event is the normalized request body,
+    without headers.
     """
-    LOGGER.info(f"Received payload {payload}...")
-
-    using_api_gateway = is_api_gateway_event(payload)
-    normalized_payload = normalize_payload(payload)
-    event = normalized_payload["body"]
-    compress_response = (
-        "gzip"
-        in normalized_payload.get("headers", {}).get("Accept-Encoding", "").lower()
-    )
-    action_name = event.get("action")
-    if action_name is None:
-        return format_response(
-            simple_response(400, "Missing action.", {"error": "action is required."}),
-            using_api_gateway,
-            compress_response,
-        )
-    try:
-        event_type = Action(action_name)
-    except ValueError:
-        return format_response(
-            simple_response(
-                400, "Unknown action.", {"error": f"Unknown action: {action_name}"}
-            ),
-            using_api_gateway,
-            compress_response,
-        )
+    event_type = Action(event["action"])
     debug_json = event.get("save_json", False)
     plan_uuid = event.get("plan_uuid", None)
-
-    if event_type is Action.GET_UPLOAD_URL:
-        # No database access needed; just return a presigned upload URL that the
-        # client can PUT the plan file to before calling import_plan.
-        key = f"import/{uuid.uuid4()}.json"
-        upload_url = s3_client.generate_presigned_url(
-            "put_object",
-            Params={"Bucket": ryhti_files_bucket, "Key": key},
-            ExpiresIn=presigned_url_expiry_seconds,
-        )
-        return format_response(
-            simple_response(
-                200, "Upload URL created.", {"upload_url": upload_url, "key": key}
-            ),
-            using_api_gateway,
-            compress_response,
-        )
-
-    precondition_error = check_action_preconditions(event_type, action_name, plan_uuid)
-    if precondition_error:
-        return format_response(precondition_error, using_api_gateway, compress_response)
 
     connection_params = get_connection_parameters(user_credentials)
     database_client = DatabaseClient(get_connection_string(**connection_params))
@@ -596,11 +670,7 @@ def handler(
             with log_duration("fetch_plan"):
                 plan = database_client.get_plan(cast("str", plan_uuid))
         except PlanNotFoundError as e:
-            return format_response(
-                simple_response(404, "Plan not found.", {"error": str(e)}),
-                using_api_gateway,
-                compress_response,
-            )
+            return simple_response(404, "Plan not found.", {"error": str(e)})
 
         if event_type is Action.GET_PLAN:
             # Upload the JSON to S3 and return a presigned download URL. The
@@ -845,4 +915,141 @@ def handler(
     else:
         lambda_response = simple_response(400, "No action taken.")
 
-    return format_response(lambda_response, using_api_gateway, compress_response)
+    return lambda_response
+
+
+def job_store() -> JobStore:
+    return JobStore(
+        get_connection_string(**get_connection_parameters(user_credentials)),
+        job_time_limit,
+    )
+
+
+def choose_job_starter(store: JobStore, context: LambdaContext) -> JobStarter:
+    """Return the job starter that JOB_RUNNER names.
+
+    The starter is the only part of job mode that differs between environments.
+    """
+    if job_runner == "inline":
+        # The local Lambda emulator cannot invoke itself, so the job runs at
+        # once, inside the submit call.
+        def run_at_once(job_id: str) -> None:
+            store.run(job_id, run_action)
+
+        return run_at_once
+    if job_runner == "lambda":
+        # The worker event of the job comes back to handler, see run_job_event.
+        return lambda_job_starter(store, lambda_client, context.invoked_function_arn)
+    raise ValueError(f"JOB_RUNNER must be 'inline' or 'lambda', not {job_runner!r}.")
+
+
+def submit_job(event: ArhoPayload, context: LambdaContext) -> Response:
+    """Store the request as a job, start the job and answer with its id."""
+    store = job_store()
+    start = choose_job_starter(store, context)
+    request = {key: value for key, value in event.items() if key != "run_as_job"}
+    try:
+        job_id = store.submit(request, start)
+    except JobNotStartedError:
+        return simple_response(
+            502,
+            "Job could not be started.",
+            {"error": "The job could not be started. Please try again later."},
+        )
+    return simple_response(202, "Job submitted.", {"job_id": job_id})
+
+
+def run_job_event(job_id: str) -> Response:
+    """Run the job of a worker event, which a JOB_RUNNER=lambda submit sends.
+
+    The duration line names the action job:<action>, so that job runs and
+    synchronous calls are separate rows in the per-action duration query.
+    Nobody reads the response to an Event invocation, so an unexpected error
+    is raised, not returned: AWS then counts the invocation as failed.
+    """
+    start = time.perf_counter()
+    request_error = check_job_id(job_id)
+    if request_error is not None:
+        return request_error
+    action = job_store().run(job_id, run_action)
+    if action is None:
+        # Not queued (a second delivery of the event), or past the time limit.
+        return simple_response(409, "Job not run.", {"job_id": job_id})
+    log_invocation_duration(f"job:{action}", start)
+    return simple_response(200, "Job run.", {"job_id": job_id})
+
+
+def get_job(job_id: str) -> Response:
+    """Respond with the state of the job, and its result when it is done.
+
+    The response is 200 whenever the job is found, so that an error status
+    always means that the poll failed, never that the job failed.
+    """
+    job = job_store().get(job_id)
+    if job is None:
+        return simple_response(
+            404, "Job not found.", {"error": f"Job '{job_id}' does not exist."}
+        )
+    details: dict[str, Any] = {
+        "job_id": job.job_id,
+        "status": job.status,
+        "result": job.result,
+    }
+    if job.status is JobStatus.FAILED:
+        details["error"] = job.error
+    return Response(
+        statusCode=200,
+        body=ResponseBody(title="Job found.", details=details, ryhti_response=None),
+    )
+
+
+def handler(
+    payload: ArhoPayload | AWSAPIGatewayPayload | dict[str, str], context: LambdaContext
+) -> Response | CompressedResponse | AWSAPIGatewayResponse:
+    """Handler which is called when the function is invoked.
+
+    A worker event runs a job in the background. Every other event is a
+    request, see handle_request.
+    """
+    if is_worker_event(payload):
+        return run_job_event(cast("dict[str, str]", payload)["job_id"])
+    return handle_request(cast("ArhoPayload | AWSAPIGatewayPayload", payload), context)
+
+
+@return_500_on_unhandled_exceptions
+@log_action_duration
+def handle_request(
+    payload: ArhoPayload | AWSAPIGatewayPayload, context: LambdaContext
+) -> Response | CompressedResponse | AWSAPIGatewayResponse:
+    """Answer a request to the endpoint. We must handle both API
+    gateway HTTP requests and regular lambda requests. API gateway requires
+    the response body to be stringified.
+
+    If lambda runs successfully, we always return 200 OK. In case a python
+    exception occurs, AWS lambda will return the exception.
+
+    We want to return general result message of the lambda run, as well as the
+    Ryhti API response for actions that call the Ryhti API.
+    """
+    LOGGER.info(f"Received payload {payload}...")
+
+    using_api_gateway = is_api_gateway_event(payload)
+    normalized_payload = normalize_payload(payload)
+    event = normalized_payload["body"]
+    compress_response = (
+        "gzip"
+        in normalized_payload.get("headers", {}).get("Accept-Encoding", "").lower()
+    )
+
+    request_error = check_request(event)
+    if request_error is not None:
+        response = request_error
+    elif is_job_submit(event):
+        response = submit_job(event, context)
+    elif event["action"] == Action.GET_UPLOAD_URL:
+        response = create_upload_url()
+    elif event["action"] == Action.GET_JOB:
+        response = get_job(cast("str", event.get("job_id")))
+    else:
+        response = run_action(event)
+    return format_response(response, using_api_gateway, compress_response)
